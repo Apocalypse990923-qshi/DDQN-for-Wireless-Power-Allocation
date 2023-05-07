@@ -1,0 +1,233 @@
+from qlearning import *
+from utils import *
+from network import *
+from keras.models import Sequential
+#from tensorflow.keras.optimizers import RMSprop
+from keras.utils import plot_model
+import shelve
+import time
+import tensorflow as tf
+from tensorflow.keras import optimizers
+from tensorflow.keras.layers import Dense, Dropout, Add, Subtract, Input, Lambda
+from tensorflow.keras.models import Model
+from tensorflow.keras import regularizers
+from tensorflow.keras.utils import multi_gpu_model
+
+# The following imports are only necessary if you're using the GPU-related functions in your code.
+from tensorflow.python.client import device_lib
+
+
+set_gpu()
+
+def get_available_gpus():
+    local_device_protos = device_lib.list_local_devices()
+    return [x.name for x in local_device_protos if x.device_type == 'GPU']
+
+
+class Duel_DLModel:
+    def __init__(self):
+        self.layers_units = [14880, 10000, 5000, 2048]
+
+    def build_model(self):
+        input_layer = Input(shape=(self.layers_units[0],), name='input_14880')
+        
+        x = Dense(units=self.layers_units[1],
+                  activation='relu',
+                  name='ds1_10000')(input_layer)
+        x = Dropout(rate=0.5)(x)
+        x = Dense(units=self.layers_units[2],
+                  activation='relu',
+                  kernel_regularizer=regularizers.l2(0.01),
+                  name='ds2_5000')(x)
+        x = Dropout(rate=0.5)(x)
+
+        # Value function stream
+        value_stream = Dense(2500, activation='relu', name='value_stream_2500')(x)
+        V = Dense(1, name='V_1')(value_stream)
+
+        # Advantage function stream
+        advantage_stream = Dense(2500, activation='relu', name='advantage_stream_2500')(x)
+        A = Dense(self.layers_units[3], name='A_2048')(advantage_stream)
+
+        # Combine value function and advantage function to estimate the action value function Q(s, a)
+        Q = Lambda(lambda values: values[0] + (values[1] - tf.reduce_mean(values[1], axis=1, keepdims=True)), name='Q_2048')([V, A])
+
+        model = Model(inputs=input_layer, outputs=Q)
+
+        if len(get_available_gpus()) > 0:
+            gpus = get_available_gpus()
+            model = multi_gpu_model(model, len(gpus))
+        return model
+
+    def generate_batch_data_random(self, data, labels, batch_size):
+        ylen = len(labels)
+        loopcount = ylen // batch_size
+        while True:
+            i = np.random.randint(0, loopcount)
+            yield (data[i * batch_size: (i + 1) * batch_size], labels[i * batch_size:(i + 1) * batch_size])
+
+    def train(self, model, x_train, y_train, epoch=200):
+        model.compile(
+            optimizer=optimizers.Adam(lr=0.0001, beta_1=0.9, beta_2=0.999),
+            loss=Tools.adjust_loss,
+            metrics=[Tools.my_metrics]
+        )
+        model.fit_generator(self.generate_batch_data_random(x_train, y_train, 32),
+                            steps_per_epoch=10, epochs=epoch)
+#        model.fit(
+#            x_train, y_train,
+#            batch_size=32,
+#            epochs=epoch
+#        )
+
+    def evaluate(self, model, epoch=100):
+        """
+        评估当前模型与最佳模型的好坏
+        :param model: 当前模型
+        :param net:  网络
+        :param epoch: 评估次数
+        :return: 更新最佳模型
+        """
+        model_best = self.load_best_model()
+        net = Network()
+        net.start()
+        scores = [0, 0]
+        #cap = [[], []]
+        if model_best is not None:
+            for i in range(epoch):
+                '''随机产生网络拓扑，来评估两个网络的调节能力'''
+                net.update()
+                epoch_data = Tools.get_epoch_data(net)
+                outs_best = self.predict(model_best, epoch_data)
+                outs_best = np.reshape(outs_best, (net.expectBS, net.subcarrier))
+                outs_best_capacity = net.compute_capacity(
+                    outs_best + net.power_subcarrier,
+                    net.BS_power + np.sum(outs_best, axis=1)
+                )
+                outs = self.predict(model, epoch_data)
+                outs = np.reshape(outs, (net.expectBS, net.subcarrier))
+                outs_capacity = net.compute_capacity(
+                    outs + net.power_subcarrier,
+                    net.BS_power + np.sum(outs, axis=1)
+                )
+                if outs_best_capacity > outs_capacity:
+                    scores[0] += 1
+                    print('The optimal Model wins...' + 'Score: ', scores[0])
+                else:
+                    scores[1] += 1
+                    print('The Current Model wins...' + 'Score: ', scores[1])
+                print('outs_capacity ', outs_capacity)
+                print('outs_best_capacity', outs_best_capacity)
+#                cap[0, i] = outs_best_capacity
+#                cap[1, i] = outs_capacity
+#            self.draw_capacity(cap, epoch, labels=['best model', 'model', ''])
+        print('Scoreboard: best_model:normal', scores[0], ':', scores[1])
+        self.save_weights(model)
+        if scores[0] > scores[1]:  # 当前模型不是最佳模型
+            print('The current model is not the best...')
+            self.save_weights(model_best)
+
+
+    def examples(self, epoch=20):
+        '''该函数用来判断模型的质量'''
+        model_best = self.load_best_model()
+
+        net = Network()
+        net.start()
+        if model_best is not None:
+            cap = np.zeros((2, epoch))
+            for i in range(epoch):
+                net.update()
+                epoch_data = Tools.get_epoch_data(net)
+                cap[0, i] = net.compute_capacity(net.power_subcarrier, net.BS_power)
+                outs_best = self.predict(model_best, epoch_data)
+                outs_best = np.reshape(outs_best, (net.expectBS, net.subcarrier))
+                outs_best_capacity = net.compute_capacity(
+                    outs_best + net.power_subcarrier,
+                    net.BS_power + np.sum(outs_best, axis=1)
+                )
+                cap[1, i] = outs_best_capacity
+                print('epoch: ', i, 'normal: ', cap[0, i], 'dueling dqn: ', cap[1, i])
+            print(cap[1] - cap[0])
+            self.draw_capacity(cap, epoch)
+
+
+    def draw_capacity(self, cap, count, labels=['Water-filling', 'Dueling DL', 'Q-learning2', 'Netouts'], c=['r','b','g','k']):
+        for i in range(len(cap)):
+            plt.plot(range(count), cap[i], c[i], label=labels[i])
+        plt.xlabel('iterations')
+        plt.ylabel('Spectral-Efficiency(bps/Hz)')
+#        plt.plot(range(count), cap[1], 'b', label=labels[1])
+#        if cap.shape[0] == 3:
+#            plt.plot(range(count), cap[2], 'g', label=labels[2])
+        plt.legend()
+        # plt.show()
+        tname = str(int(time.time()))
+        filename = 'duel_' + tname + '_.png'
+        plt.savefig(Tools.duel_qf_image + '/' + filename)
+        with open(Tools.duel_qf_image + '/' + tname + '.txt', 'w') as fw:
+            fw.write(str(cap.flatten()))
+        plt.close()
+
+
+    def model_summary(self):
+        best_model = self.load_best_model()
+        best_model.summary()
+        plot_model(best_model, to_file=Tools.duel_qf_image + '/Model.png')
+
+
+    def predict(self, model, x_test):
+        x_test.reshape((self.layers_units[0],))
+        outs = model.predict(x_test)
+        # print('outs: ', outs)
+        return outs
+
+
+    def save_weights(self, model):
+        '''保留最新的2个模型，t最大的为best_model'''
+        models = os.listdir(Tools.duel_qf_model)
+        if len(models) >= 2:
+            tim = []
+            for i in range(len(models)):
+                tim.append(int(models[i].split('_')[1]))
+            os.remove(Tools.duel_qf_model + '/weights_' + str(np.min(tim)) + '_.h5')
+        model.save_weights(Tools.duel_qf_model + '/weights_' + str(int(time.time())) + '_.h5')
+
+
+    def load_best_model(self):
+        '''加载当前最佳model'''
+        models = os.listdir(Tools.duel_qf_model)
+        if len(models) != 0:
+            tim = []
+            for i in range(len(models)):
+                tim.append(int(models[i].split('_')[1]))
+            best_model = self.build_model()
+            best_model.load_weights(Tools.duel_qf_model + '/weights_' + str(np.max(tim)) + '_.h5')
+            best_model.compile(
+                optimizer=optimizers.Adam(lr=0.0001, beta_1=0.9, beta_2=0.999),
+                loss=Tools.adjust_loss,
+                metrics=[Tools.my_metrics]
+            )
+            return best_model
+        else:
+            print('No model currently...')
+            return None
+
+
+    def load_data(self, model_num):
+        '''加载最新数据'''
+        if len(os.listdir(Tools.duel_qf_data)) == 0:
+            print('No data can be loaded...')
+            return None
+        datas = os.listdir(Tools.duel_qf_data)
+        tim = []
+        for i in range(len(datas)):
+            tim.append(int(datas[i].split('_')[2]))
+        datas_x = shelve.open(Tools.duel_qf_data + '/' + model_num + '_x_' + str(np.max(tim)) + '_.bd', writeback=True, flag='c')
+        datas_y = shelve.open(Tools.duel_qf_data + '/' + model_num + '_y_' + str(np.max(tim)) + '_.bd', writeback=True, flag='c')
+        x_data = datas_x['epoch_data']
+        y_label = datas_y['epoch_data']
+
+        datas_x.close()
+        datas_y.close()
+        return x_data, y_label
